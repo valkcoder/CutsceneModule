@@ -126,7 +126,7 @@ function CutsceneModule.PlayCutscene(name: string)
 	local ogParents = {}
 	
 	if options.AdditionalAnimations then
-		for _, anim: AdditionalAnimation in ipairs(options.AdditionalAnimations) do
+		for _, anim: AdditionalAnimation in pairs(options.AdditionalAnimations) do
 			local model = if options.CloneModels then anim.Model:Clone() else anim.Model
 			
 			if anim.Animation then
@@ -155,7 +155,7 @@ function CutsceneModule.PlayCutscene(name: string)
 	-- Remove accessories
 	local accessoryHolder
 	
-	if options.CameraAnimation then
+	if options.UsePlayerAsCamera then
 		accessoryHolder = Instance.new("Folder")
 		
 		for _, child in pairs(char:GetChildren()) do
