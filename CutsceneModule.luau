@@ -9,7 +9,7 @@ CutsceneModule.PlayingAnimation = false
 
 export type AdditionalAnimation = {
 	Model: Model,
-	Animation: Animation?
+	Animation: Animation
 }
 
 export type Options = {
