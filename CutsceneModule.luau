@@ -29,10 +29,15 @@ export type Options = {
 	HideOtherPlayers: boolean?
 }
 
--- Get all instances that we have to preload so the cutscene plays smoothly
+
+
+-- Collect every instance that should be preloaded.
+-- This ensures all models, animations, and sounds are ready before the cutscene starts
+-- so playback is smooth and nothing loads mid-animation.
 local function GetAssetsToPreload(options: Options): { Instance }
 	local Assets = {}
 	
+	-- Recursively check all descendants of an instance so they also get preloaded.
 	local function CheckChildren(instance: Instance)
 		for _, child in pairs(instance:GetChildren()) do
 			table.insert(Assets, child)
@@ -41,6 +46,8 @@ local function GetAssetsToPreload(options: Options): { Instance }
 		end
 	end
 	
+	-- Loop through every value in the options and get anything that is an instance.
+	-- This includes animations, rigs, sounds, models, etc.
 	for _, value in pairs(options) do
 		if typeof(value) == "Instance" then
 			table.insert(Assets, value)
@@ -52,11 +59,267 @@ local function GetAssetsToPreload(options: Options): { Instance }
 	return Assets
 end
 
+
+
+-- Grab the humanoid or animation controller inside a model.
+-- The cutscene system requires a model that can play animations. Both types work.
+local function GetAnimator(model: Model): Humanoid | AnimationController
+	local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+	if humanoid then
+		return humanoid
+	end
+	
+	local controller = model:FindFirstChildWhichIsA("AnimationController")
+	assert(controller, "Model needs a Humanoid or AnimationController to play animations.")
+	
+	return controller
+end
+
+
+
+-- Load animation tracks
+local function LoadTrackForModel(model: Model, animation: Animation): AnimationTrack
+	local animator = GetAnimator(model)
+	local track: AnimationTrack = animator:LoadAnimation(animation)
+	
+	track.Looped = false
+	track.Priority = Enum.AnimationPriority.Action4 -- high priority so it visually overrides everything
+	
+	return track
+end
+
+
+
+-- Temporarily remove player accessories so the camera view isn't blocked when
+-- the player becomes the camera model. 
+local function RemoveAccessories(character: Model): Folder?
+	local holder = Instance.new("Folder")
+	holder.Name = "AccessoryHolder"
+	
+	local hasAccessories = false
+	
+	for _, child in pairs(character:GetChildren()) do
+		if child:IsA("Accessory") then
+			child.Parent = holder
+			hasAccessories = true
+		end
+	end
+	
+	if not hasAccessories then
+		holder:Destroy()
+		return nil
+	end
+	
+	return holder
+end
+
+
+
+-- Restore accessories that were previously removed.
+-- Must be done so the character returns to normal after the cutscene.
+local function RestoreAccessories(character: Model, holder: Folder?)
+	if not holder then
+		return
+	end
+	
+	for _, child in pairs(holder:GetChildren()) do
+		if child:IsA("Accessory") then
+			child.Parent = character
+		end
+	end
+	
+	holder:Destroy()
+end
+
+
+
+-- When requested, hide all other players by making their character parts transparent.
+local function SetOtherPlayersHidden(hidden: boolean)
+	local localPlayer = Players.LocalPlayer
+	
+	for _, plr in Players:GetPlayers() do
+		if plr == localPlayer then
+			continue
+		end
+		
+		local char = plr.Character
+		if not char then
+			continue
+		end
+		
+		for _, desc in pairs(char:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				
+				-- Skip past HRP
+				if desc.Name == "HumanoidRootPart" then
+					continue
+				end
+				
+				desc.Transparency = hidden and 1 or 0
+			end
+		end
+	end
+end
+
+
+
+-- Construct all animations used in the cutscene.
+-- This includes:
+-- - Player animation
+-- - Camera rig animation
+-- - Any additional animated models
+-- It also clones models if requested and prepares them for playback.
+local function BuildAnimationsAndModels(options: Options, char: Model)
+	local animations: { AnimationTrack } = {}
+	local models = {}
+	local ogParents = {}
+	
+	-- Teleport character before the cutscene if needed
+	if options.TeleportPart then
+		char.HumanoidRootPart.CFrame = options.TeleportPart.CFrame
+	end
+	
+	-- Player animation track
+	if options.IncludePlayer and options.PlayerAnimation then
+		local track = LoadTrackForModel(char, options.PlayerAnimation)
+		table.insert(animations, track)
+	end
+	
+	-- Camera rig animation
+	if (not options.UsePlayerAsCamera) and options.CameraRig and options.CameraAnimation then
+		local track = LoadTrackForModel(options.CameraRig, options.CameraAnimation)
+		table.insert(animations, track)
+	end
+	
+	-- Extra model animations
+	if options.AdditionalAnimations then
+		for _, anim: AdditionalAnimation in pairs(options.AdditionalAnimations) do
+			
+			-- Clone or reuse model depending on user preference
+			local model = if options.CloneModels then anim.Model:Clone() else anim.Model
+			
+			-- Load animation if provided
+			if anim.Animation then
+				local track = LoadTrackForModel(model, anim.Animation)
+				table.insert(animations, track)
+			end
+			
+			-- If model is reused, save its original parent so we can restore later
+			if not options.CloneModels then
+				ogParents[model] = model.Parent
+			end
+			
+			model.Parent = workspace
+			
+			table.insert(models, model)
+		end
+	end
+	
+	return animations, models, ogParents
+end
+
+
+
+-- Preload animations right before they play.
+-- This is so the animations dont start too late caused by them not being loaded.
+local function PreloadTracks(tracks: { AnimationTrack })
+	for _, animation: AnimationTrack in pairs(tracks) do
+		ContentProvider:PreloadAsync({ animation })
+	end
+end
+
+
+
+-- Start all animations and block until every animation finishes.
+local function PlayTracksAndWait(tracks: { AnimationTrack })
+	local count = #tracks
+	if count == 0 then
+		return
+	end
+	
+	local completed = 0
+	
+	-- Attach ended callbacks first, then play, so we don't miss events
+	for _, animation: AnimationTrack in pairs(tracks) do
+		animation.Ended:Once(function()
+			completed += 1
+		end)
+	end
+	
+	for _, animation: AnimationTrack in pairs(tracks) do
+		animation:Play()
+	end
+	
+	-- Wait for all animations to fire Ended
+	repeat
+		task.wait()
+	until completed == count
+end
+
+
+
+-- Start a camera override loop that moves the camera every PreRender
+local function SetupCameraLoop(options: Options, char: Model, camera: Camera)
+	local subjectPart
+	
+	-- Determine which part the camera should follow:
+	-- - Player's head
+	-- - Or the camera rig's primary part
+	if options.UsePlayerAsCamera then
+		subjectPart = char:FindFirstChild("Head")
+	else
+		if options.CameraRig then
+			subjectPart = options.CameraRig.PrimaryPart
+		end
+	end
+	
+	-- If no valid subject, cutscene continues but camera stays normal
+	if not subjectPart then
+		return nil
+	end
+	
+	camera.CameraSubject = subjectPart
+	
+	-- Force the camera CFrame each PreRender frame
+	local con = RunService.PreRender:Connect(function()
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CFrame = subjectPart.CFrame
+		
+		-- Ensure player stays fully visible to themselves
+		for _, child in pairs(char:GetChildren()) do
+			if child:IsA("BasePart") then
+				child.LocalTransparencyModifier = 0
+			end
+		end
+	end)
+	
+	return con
+end
+
+
+
+-- Restore all models to their original state.
+-- If they were cloned, destroy, and if reused, restore original parent.
+local function CleanupModels(models, ogParents, cloneModels: boolean?)
+	if cloneModels then
+		for _, model in pairs(models) do
+			model:Destroy()
+		end
+	else
+		for model, parent in pairs(ogParents) do
+			model.Parent = parent
+		end
+	end
+end
+
+
+
 --[=[
-	Registers a new cutscene with the name and the options.
+	Register a new cutscene with the provided name and options.
+	This validates the structure and preloads all assets beforehand.
 ]=]
 function CutsceneModule.RegisterCutscene(name: string, options: Options)
-	-- Checks
+	-- Check animation logic so users don't register invalid cutscenes
 	assert(not options.IncludePlayer or options.PlayerAnimation, "When using IncludePlayer, the player animation should be present!")
 	
 	if options.AdditionalAnimations then
@@ -73,16 +336,25 @@ function CutsceneModule.RegisterCutscene(name: string, options: Options)
 		assert(options.IncludePlayer and options.PlayerAnimation, "You must include the player and provide a player animation if using the player as the camera!")
 	end
 	
-	--
-	
+	-- Prepare content for smooth playback
 	local AssetsToPreload = GetAssetsToPreload(options)
-	
 	ContentProvider:PreloadAsync(AssetsToPreload)
+	
 	CutsceneModule.Cutscenes[name] = options
 end
 
+
+
 --[=[
-Plays a cutscene with the name that you used when registering.
+	Play the cutscene associated with the provided name.
+
+	What this function handles:
+	- Preparing animations
+	- Teleporting character if required
+	- Hiding other players
+	- Setting up and controlling the camera
+	- Playing animations and sounds in sync
+	- Cleaning up everything afterwards
 ]=]
 function CutsceneModule.PlayCutscene(name: string)
 	assert(not CutsceneModule.PlayingAnimation, "You can't play multiple cutscenes at once.")
@@ -91,159 +363,73 @@ function CutsceneModule.PlayCutscene(name: string)
 	CutsceneModule.PlayingAnimation = true
 	
 	local options = CutsceneModule.Cutscenes[name]
-	local animations: { AnimationTrack } = {}
 	local plr = Players.LocalPlayer
 	local char = plr.Character or plr.CharacterAdded:Wait()
 	local camera = workspace.CurrentCamera
 	
-	if options.TeleportPart then
-		char.HumanoidRootPart.CFrame = options.TeleportPart.CFrame
-	end
-	
-	if options.IncludePlayer then
-		local thingToPlayAnimWith = char:FindFirstChildWhichIsA("Humanoid") or char:FindFirstChildWhichIsA("AnimationController")
-		local track: AnimationTrack = thingToPlayAnimWith:LoadAnimation(options.PlayerAnimation)
-		track.Looped = false
-		track.Priority = Enum.AnimationPriority.Action4
-
-		table.insert(animations, 
-			track
-		)
-	end
-	
-	if not options.UsePlayerAsCamera then
-		local thingToPlayAnimWith = options.CameraRig:FindFirstChildWhichIsA("Humanoid") or options.CameraRig:FindFirstChildWhichIsA("AnimationController")
-		local track: AnimationTrack = thingToPlayAnimWith:LoadAnimation(options.CameraAnimation)
-		track.Looped = false
-		track.Priority = Enum.AnimationPriority.Action4
-
-		table.insert(animations, 
-			track
-		)
-	end
-	
-	local models = {}
-	local ogParents = {}
-	
-	if options.AdditionalAnimations then
-		for _, anim: AdditionalAnimation in pairs(options.AdditionalAnimations) do
-			local model = if options.CloneModels then anim.Model:Clone() else anim.Model
-			
-			if anim.Animation then
-				local thingToPlayAnimWith = model:FindFirstChildWhichIsA("Humanoid") or model:FindFirstChildWhichIsA("AnimationController")
-				local track: AnimationTrack = thingToPlayAnimWith:LoadAnimation(anim.Animation)
-				track.Looped = false
-				track.Priority = Enum.AnimationPriority.Action4
-
-				table.insert(animations, 
-					track
-				)
-			end
-			
-			if not options.CloneModels then
-				ogParents[model] = model.Parent
-			end
-			
-			model.Parent = game.Workspace
-			
-			table.insert(models, model)
-		end
-	end
+	-- Build animation tracks, clone models if needed, and prepare the scene
+	local animations, models, ogParents = BuildAnimationsAndModels(options, char)
 	
 	local CompletedAnimations = 0
-	
-	-- Remove accessories
 	local accessoryHolder
 	
+	-- Hide accessories when using player-head camera to avoid clipping
 	if options.UsePlayerAsCamera then
-		accessoryHolder = Instance.new("Folder")
-		
-		for _, child in pairs(char:GetChildren()) do
-			if child:IsA("Accessory") then
-				child.Parent = accessoryHolder
-			end
-		end
+		accessoryHolder = RemoveAccessories(char)
 	end
 	
+	-- Hide other players if requested to avoid visual interruption
 	if options.HideOtherPlayers then
-		for _, plr in Players:GetPlayers() do
-			if plr == Players.LocalPlayer then continue end
-			
-			local char = plr.Character
-			if not char then continue end
-			
-			for _, desc in pairs(char:GetDescendants()) do
-				if desc:IsA("BasePart") then
-					desc.Transparency = 1
-				end
-			end
-		end
+		SetOtherPlayersHidden(true)
 	end
 	
+	-- Anchor player so physics doesn't interfere with the animation
 	char.HumanoidRootPart.Anchored = true
 	
-	-- Preload the animations
-	for _, animation: AnimationTrack in pairs(animations) do
-		ContentProvider:PreloadAsync({animation})
-	end
+	-- Ensure every AnimationTrack is preloaded into memory
+	PreloadTracks(animations)
 	
-	-- Play the animations
+	-- Count finishing animations so we can sync them
 	for _, animation: AnimationTrack in pairs(animations) do
-		animation:Play()
-		
 		animation.Ended:Once(function()
 			CompletedAnimations += 1
 		end)
 	end
 	
-	-- Play the sound
+	-- Optional cutscene sound
 	if options.Sound then
 		options.Sound:Play()
 	end
 	
-	-- Set the camera
+	-- Force custom camera type before camera loop
 	local originalSubject = camera.CameraSubject
 	
 	repeat
-		task.wait() camera.CameraType = Enum.CameraType.Custom
+		task.wait()
+		camera.CameraType = Enum.CameraType.Custom
 	until camera.CameraType == Enum.CameraType.Custom
 	
-	local con
+	-- Begin forced camera loop
+	local con = SetupCameraLoop(options, char, camera)
 	
-	if options.UsePlayerAsCamera then
-		camera.CameraSubject = char.Head
-		
-		-- Update camera every frame
-		con = RunService.PreRender:Connect(function()
-			camera.CFrame = char.Head.CFrame
-			
-			for _, child in pairs(char:GetChildren()) do
-				if child:IsA("BasePart") then
-					child.LocalTransparencyModifier = 0
-				end
-			end
-		end)
-	else
-		local part = options.CameraRig.PrimaryPart
-		camera.CameraSubject = part
-		
-		-- Update camera every frame
-		con = RunService.PreRender:Connect(function()
-			camera.CFrame = part.CFrame
-			
-			for _, child in pairs(char:GetChildren()) do
-				if child:IsA("BasePart") then
-					child.LocalTransparencyModifier = 0
-				end
-			end
-		end)
+	-- Start animations only after camera is ready
+	for _, animation: AnimationTrack in pairs(animations) do
+		animation:Play()
 	end
 	
-	repeat task.wait() until CompletedAnimations == #animations
+	-- Wait until all animations report completion
+	repeat
+		task.wait()
+	until CompletedAnimations == #animations
 	
-	-- Restore everything
 	
-	con:Disconnect()
+	
+	-- ======== RESTORE EVERYTHING ======== --
+	
+	if con then
+		con:Disconnect()
+	end
+	
 	camera.CameraSubject = originalSubject
 	char.HumanoidRootPart.Anchored = false
 	CutsceneModule.PlayingAnimation = false
@@ -252,40 +438,14 @@ function CutsceneModule.PlayCutscene(name: string)
 		options.Sound:Stop()
 	end
 	
-	if accessoryHolder then
-		for _, child in pairs(accessoryHolder:GetChildren()) do
-			if child:IsA("Accessory") then
-				child.Parent = char
-			end
-		end
-	end
-	
-	if options.CloneModels then
-		for _, model in pairs(models) do
-			model:Destroy()
-		end
-	else
-		for model, parent in pairs(ogParents) do
-			model.Parent = parent
-		end
-	end
+	RestoreAccessories(char, accessoryHolder)
+	CleanupModels(models, ogParents, options.CloneModels)
 	
 	if options.HideOtherPlayers then
-		for _, plr in Players:GetPlayers() do
-			if plr == Players.LocalPlayer then continue end
-
-			local char = plr.Character
-			if not char then continue end
-
-			for _, desc in pairs(char:GetDescendants()) do
-				if desc:IsA("BasePart") then
-					if desc.Name == "HumanoidRootPart" then continue end
-					
-					desc.Transparency = 0
-				end
-			end
-		end
+		SetOtherPlayersHidden(false)
 	end
 end
+
+
 
 return CutsceneModule
