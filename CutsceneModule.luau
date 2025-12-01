@@ -91,7 +91,7 @@ end
 
 
 -- Temporarily remove player accessories so the camera view isn't blocked when
--- the player becomes the camera model. 
+-- the player becomes the camera model. It does this by creating a folder with all accessories.
 local function RemoveAccessories(character: Model): Folder?
 	local holder = Instance.new("Folder")
 	holder.Name = "AccessoryHolder"
@@ -220,7 +220,7 @@ end
 
 
 
--- Preload animations right before they play.
+-- Preload animations right before they play. It uses ContentProvider.
 -- This is so the animations dont start too late caused by them not being loaded.
 local function PreloadTracks(tracks: { AnimationTrack })
 	for _, animation: AnimationTrack in pairs(tracks) do
@@ -230,7 +230,7 @@ end
 
 
 
--- Start all animations and block until every animation finishes.
+-- Start all animations and wait until every animation finishes.
 local function PlayTracksAndWait(tracks: { AnimationTrack })
 	local count = #tracks
 	if count == 0 then
@@ -239,7 +239,7 @@ local function PlayTracksAndWait(tracks: { AnimationTrack })
 	
 	local completed = 0
 	
-	-- Attach ended callbacks first, then play, so we don't miss events
+	-- Connect .Ended connections first, then play, so we don't miss events
 	for _, animation: AnimationTrack in pairs(tracks) do
 		animation.Ended:Once(function()
 			completed += 1
@@ -299,7 +299,7 @@ end
 
 
 -- Restore all models to their original state.
--- If they were cloned, destroy, and if reused, restore original parent.
+-- If they were cloned, destroy them, and if reused, restore their original parent.
 local function CleanupModels(models, ogParents, cloneModels: boolean?)
 	if cloneModels then
 		for _, model in pairs(models) do
@@ -336,7 +336,7 @@ function CutsceneModule.RegisterCutscene(name: string, options: Options)
 		assert(options.IncludePlayer and options.PlayerAnimation, "You must include the player and provide a player animation if using the player as the camera!")
 	end
 	
-	-- Prepare content for smooth playback
+	-- Preload content for smooth playback
 	local AssetsToPreload = GetAssetsToPreload(options)
 	ContentProvider:PreloadAsync(AssetsToPreload)
 	
@@ -353,7 +353,7 @@ end
 	- Teleporting character if required
 	- Hiding other players
 	- Setting up and controlling the camera
-	- Playing animations and sounds in sync
+	- Playing animations and sounds
 	- Cleaning up everything afterwards
 ]=]
 function CutsceneModule.PlayCutscene(name: string)
@@ -367,7 +367,7 @@ function CutsceneModule.PlayCutscene(name: string)
 	local char = plr.Character or plr.CharacterAdded:Wait()
 	local camera = workspace.CurrentCamera
 	
-	-- Build animation tracks, clone models if needed, and prepare the scene
+	-- Build animation tracks, clone models if needed and prepare the scene
 	local animations, models, ogParents = BuildAnimationsAndModels(options, char)
 	
 	local CompletedAnimations = 0
@@ -378,18 +378,17 @@ function CutsceneModule.PlayCutscene(name: string)
 		accessoryHolder = RemoveAccessories(char)
 	end
 	
-	-- Hide other players if requested to avoid visual interruption
+	-- Hide other players if requested
 	if options.HideOtherPlayers then
 		SetOtherPlayersHidden(true)
 	end
 	
-	-- Anchor player so physics doesn't interfere with the animation
+	-- Anchor player so physics dont mess up the cutscene
 	char.HumanoidRootPart.Anchored = true
 	
-	-- Ensure every AnimationTrack is preloaded into memory
 	PreloadTracks(animations)
 	
-	-- Count finishing animations so we can sync them
+	-- Count finishing animations
 	for _, animation: AnimationTrack in pairs(animations) do
 		animation.Ended:Once(function()
 			CompletedAnimations += 1
