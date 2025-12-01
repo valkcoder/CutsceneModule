@@ -280,7 +280,7 @@ local function SetupCameraLoop(options: Options, char: Model, camera: Camera)
 	
 	camera.CameraSubject = subjectPart
 	
-	-- Force the camera CFrame each PreRender frame
+	-- Force the camera CFrame each PreRender
 	local con = RunService.PreRender:Connect(function()
 		camera.CameraType = Enum.CameraType.Custom
 		camera.CFrame = subjectPart.CFrame
